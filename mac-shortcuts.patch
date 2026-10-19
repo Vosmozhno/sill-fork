@@ -1,0 +1,977 @@
+diff --git a/.github/workflows/windows-shortcuts.yml b/.github/workflows/windows-shortcuts.yml
+new file mode 100644
+index 0000000..cd5d662
+--- /dev/null
++++ b/.github/workflows/windows-shortcuts.yml
+@@ -0,0 +1,40 @@
++name: Windows with Mac shortcuts
++
++on:
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++jobs:
++  keyboard:
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@v4
++      - name: Keyboard regression checks
++        run: cargo test --locked --manifest-path viewer/tests/keyboard/Cargo.toml
++
++  windows:
++    needs: keyboard
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@v4
++      # Same cross-compilation tools and FFmpeg preparation as the upstream build workflow.
++      - name: Tools
++        run: |
++          sudo apt-get update -qq
++          sudo apt-get install -y -qq mingw-w64 mingw-w64-tools clang libclang-dev wine64 zip python3-pip
++          rustup target add x86_64-pc-windows-gnu
++          sudo mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc || true
++          echo ':DOSWin:M::MZ::/usr/bin/wine:' | sudo tee /proc/sys/fs/binfmt_misc/register
++          WINEDEBUG=-all wineboot -i || true
++      - name: FFmpeg for Windows
++        run: bash viewer/scripts/prepare-ffmpeg-windows.sh "$RUNNER_TEMP/ffmpeg-win"
++      - name: Build and package
++        working-directory: viewer
++        run: FFMPEG_WIN="$RUNNER_TEMP/ffmpeg-win" bash ./build-windows.sh
++      - uses: actions/upload-artifact@v4
++        with:
++          name: SillViewer-windows-mac-shortcuts
++          path: viewer/target/SillViewer-windows.zip
++          if-no-files-found: error
+diff --git a/viewer/README.md b/viewer/README.md
+index 81ce1a3..72fc814 100644
+--- a/viewer/README.md
++++ b/viewer/README.md
+@@ -44,6 +44,31 @@ WINDOWS
+ Unzip SillViewer-windows.zip anywhere. Run "Sill Viewer.exe". Keep the DLL files next to it.
+ Windows asks once to let it through the firewall: allow it on private networks.
+ 
++WINDOWS KEYBOARD SHORTCUTS FOR A MAC
++In the stream window, turn on "Mac shortcuts (Ctrl → ⌘)", then click the picture.
++Ctrl+Q quits the Mac app, Ctrl+W closes its window, Ctrl+S saves, Ctrl+T opens a tab,
++and Ctrl+C/X/V/A/Z send the corresponding Command shortcuts. Shift and Alt keep their
++usual meanings (Shift and Option). The choice is saved separately for each paired host.
++
++Turn the option off for native Mac Control shortcuts (for example, Ctrl+C to interrupt
++a terminal command) or when connecting to Linux. It is off for a new host. The Windows
++logo key is not captured or remapped, and Windows shortcuts such as Alt+Tab remain local.
++Ctrl+Alt+Shift+F still controls the viewer's full screen mode. The mapping does not
++apply to local viewer controls, including the pairing code and address fields.
++
++Keys are released on focus loss, disconnect, quitting, or a mapping change. To change
++the option while full screen is on, leave full screen with Ctrl+Alt+Shift+F first.
++
++BUILD THIS CHANGE FOR WINDOWS
++The manual "Windows with Mac shortcuts" GitHub Actions workflow runs the keyboard
++checks, builds the Windows executable and packages it with its DLLs. In your fork,
++open Actions, choose that workflow, click "Run workflow", then download the
++SillViewer-windows-mac-shortcuts artifact from the completed run. It contains
++SillViewer-windows.zip; extract that zip before running the executable.
++
++Keyboard checks alone (no FFmpeg or display required):
++  cargo test --locked --manifest-path tests/keyboard/Cargo.toml
++
+ MAC
+ In Terminal, in this folder:   ./build-mac.sh
+ It installs Homebrew's ffmpeg and Rust if needed, builds "Sill Viewer.app" and puts it in
+diff --git a/viewer/src/app.rs b/viewer/src/app.rs
+index a5e7103..7b7eaf9 100644
+--- a/viewer/src/app.rs
++++ b/viewer/src/app.rs
+@@ -31,6 +31,15 @@ fn set_zoom(z: u32) {
+     let _ = std::fs::write(identity::config_dir().join("zoom.txt"), z.to_string());
+ }
+ 
++fn shortcut_setting(fp: &[u8; 32]) -> std::path::PathBuf {
++    identity::config_dir().join(format!("keyboard-{}.txt", identity::b64u(fp)))
++}
++
++fn load_mac_shortcuts(fp: &[u8; 32]) -> bool {
++    cfg!(windows) && std::fs::read_to_string(shortcut_setting(fp))
++        .is_ok_and(|value| value.trim() == "mac")
++}
++
+ #[derive(Clone)]
+ struct Target {
+     name: String,
+@@ -72,7 +81,9 @@ struct Live {
+     rtt: f64,
+     sent_viewport: (f32, f32, u32, u32, u32, u32),
+     match_screen: bool,
+-    sent_mods: Modifiers,
++    keyboard: input::Keyboard,
++    /// Explicit, per-host choice: the wire format does not identify the host's OS reliably.
++    mac_shortcuts: bool,
+     buttons_down: Vec<&'static str>,
+     scroll_open: Option<Instant>,
+     last_pos: (f64, f64),
+@@ -176,6 +187,10 @@ impl App {
+     /// What the tray asked for.
+     fn tray_command(&mut self, ctx: &egui::Context, cmd: &str) {
+         if cmd == "quit" {
++            if let Screen::Stream(live, _) = &mut self.screen {
++                release_all(live);
++                live.session.stop();
++            }
+             self.quitting = true;
+             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+             return;
+@@ -197,7 +212,8 @@ impl App {
+                 })
+             };
+             if let Some(t) = target {
+-                if let Screen::Stream(live, _) = &self.screen {
++                if let Screen::Stream(live, _) = &mut self.screen {
++                    release_all(live);
+                     live.session.stop();
+                 }
+                 self.connect(t);
+@@ -207,6 +223,7 @@ impl App {
+         let Screen::Stream(live, _) = &mut self.screen else { return };
+         match cmd {
+             "disconnect" => {
++                release_all(live);
+                 live.session.stop();
+                 if live.fullscreen {
+                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+@@ -299,9 +316,11 @@ impl App {
+             let shared = Arc::new(Mutex::new(Shared::default()));
+             let r = Session::start(&t.addr, &id, pin, ev_tx, v_tx, wake.clone()).map(|session| {
+                 decode::spawn(v_rx, shared.clone(), wake.clone());
++                let mac_shortcuts = load_mac_shortcuts(&session.host_fp);
+                 Box::new(Live {
+                     session, events: ev_rx, shared, windows: vec![], active: json!({"none": {}}), mac_name: t.name.clone(), machines: vec![], switch_to: None, note: None, auto_pick: None, listed: false, pan: (0.5, 0.5), files_ok: false,
+-                    settings: None, rtt: 0.0, sent_viewport: (0.0, 0.0, 0, 0, 0, 0), match_screen: false, sent_mods: Modifiers::NONE,
++                    settings: None, rtt: 0.0, sent_viewport: (0.0, 0.0, 0, 0, 0, 0), match_screen: false,
++                    keyboard: input::Keyboard::default(), mac_shortcuts,
+                     buttons_down: vec![], scroll_open: None, last_pos: (0.5, 0.5), token: 0, fps: 60,
+                     cursor_in_video: false, fullscreen: false, os_fullscreen: None,
+                 })
+@@ -545,6 +564,7 @@ impl eframe::App for App {
+             Screen::Stream(mut live, target) => match stream(ctx, &mut live, &target) {
+                 None => Screen::Stream(live, target),
+                 Some(why) => {
++                    release_all(&mut live);
+                     live.session.stop();
+                     if live.fullscreen {
+                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+@@ -778,6 +798,20 @@ fn stream(ctx: &egui::Context, live: &mut Live, target: &Target) -> Option<Strin
+                     ui.label(RichText::new(format!("{}×{} · {} · {:.0} ms", sh.size.0, sh.size.1, sh.decoder, live.rtt)).weak());
+                 });
+             });
++            // Include the control in test builds so it is type-checked on non-Windows hosts too.
++            #[cfg(any(windows, test))]
++            ui.horizontal(|ui| {
++                if ui.checkbox(&mut live.mac_shortcuts, "Mac shortcuts (Ctrl → ⌘)")
++                    .on_hover_text("Send Ctrl as Command to this Mac. Turn off for Mac Control shortcuts or a Linux host.")
++                    .changed() {
++                    release_all(live);
++                    if let Err(e) = std::fs::write(shortcut_setting(&live.session.host_fp),
++                        if live.mac_shortcuts { "mac" } else { "native" }) {
++                        live.note = Some((format!("Keyboard setting could not be saved: {e}"), Instant::now()));
++                    }
++                }
++                ui.label(if live.mac_shortcuts { "Ctrl+Q → ⌘Q · Alt → ⌥" } else { "Ctrl → Control · Alt → ⌥" });
++            });
+         });
+     }
+ 
+@@ -804,6 +838,9 @@ fn stream(ctx: &egui::Context, live: &mut Live, target: &Target) -> Option<Strin
+         let crop = [(shown.min.x - rect.min.x) / rect.width(), (shown.min.y - rect.min.y) / rect.height(),
+                     (shown.max.x - rect.min.x) / rect.width(), (shown.max.y - rect.min.y) / rect.height()];
+         let resp = ui.allocate_rect(avail, egui::Sense::click_and_drag());
++        if resp.clicked() {
++            resp.request_focus();
++        }
+         if vw > 0 && shown.width() > 0.0 && shown.height() > 0.0 {
+             ui.painter().add(egui_wgpu::Callback::new_paint_callback(shown, VideoCallback { shared: live.shared.clone(), crop }));
+         } else {
+@@ -831,7 +868,8 @@ fn stream(ctx: &egui::Context, live: &mut Live, target: &Target) -> Option<Strin
+             live.sent_viewport = vp;
+             live.session.viewport(vp.0 as f64, vp.1 as f64, vp.2, pixels, ppp_now);
+         }
+-        handle_input(ctx, live, rect, resp.hovered() || resp.dragged(), &mut leave);
++        let keyboard_active = resp.has_focus() || !ctx.wants_keyboard_input();
++        handle_input(ctx, live, rect, resp.hovered() || resp.dragged(), keyboard_active, &mut leave);
+     });
+ 
+     if live.scroll_open.is_some_and(|t| t.elapsed() > Duration::from_millis(150)) {
+@@ -841,7 +879,7 @@ fn stream(ctx: &egui::Context, live: &mut Live, target: &Target) -> Option<Strin
+     leave.map(|s| if s.is_empty() { String::new() } else { s })
+ }
+ 
+-fn handle_input(ctx: &egui::Context, live: &mut Live, rect: Rect, over: bool, leave: &mut Option<String>) {
++fn handle_input(ctx: &egui::Context, live: &mut Live, rect: Rect, over: bool, keyboard_active: bool, leave: &mut Option<String>) {
+     let to_frac = |p: Pos2| -> (f64, f64) {
+         (((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0) as f64, ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0) as f64)
+     };
+@@ -854,17 +892,18 @@ fn handle_input(ctx: &egui::Context, live: &mut Live, rect: Rect, over: bool, le
+     if over && live.cursor_in_video {
+         ctx.set_cursor_icon(egui::CursorIcon::None);   // the host draws its own cursor into the video
+     }
+-    for (usage, down) in input::modifier_changes(&live.sent_mods, &mods) {
+-        live.session.input(input::key(usage, down, &mods));
++    if !keyboard_active {
++        for message in live.keyboard.release_all() {
++            live.session.input(message);
++        }
+     }
+-    live.sent_mods = mods;
+     for ev in events {
+         match ev {
+             egui::Event::PointerMoved(p) if over || !live.buttons_down.is_empty() => {
+                 live.last_pos = to_frac(p);
+                 live.session.input(input::pointer("move", live.last_pos.0, live.last_pos.1));
+             }
+-            egui::Event::PointerButton { pos, button, pressed, .. } if over || !pressed => {
++            egui::Event::PointerButton { pos, button, pressed, modifiers } if over || !pressed => {
+                 let action = match (button, pressed) {
+                     (egui::PointerButton::Primary, true) => "leftDown",
+                     (egui::PointerButton::Primary, false) => "leftUp",
+@@ -876,6 +915,11 @@ fn handle_input(ctx: &egui::Context, live: &mut Live, rect: Rect, over: bool, le
+                 if !pressed && !live.buttons_down.contains(&down) {
+                     continue;   // an up whose down was not ours (it started outside the video)
+                 }
++                if keyboard_active {
++                    for message in live.keyboard.modifiers(input::remote_modifiers(modifiers, live.mac_shortcuts)) {
++                        live.session.input(message);
++                    }
++                }
+                 live.last_pos = to_frac(pos);
+                 live.session.input(input::pointer(action, live.last_pos.0, live.last_pos.1));
+                 if pressed { live.buttons_down.push(down) } else { live.buttons_down.retain(|b| *b != down) }
+@@ -894,7 +938,10 @@ fn handle_input(ctx: &egui::Context, live: &mut Live, rect: Rect, over: bool, le
+                                                  (px.x / rect.width()) as f64, (px.y / rect.height()) as f64));
+             }
+             egui::Event::Key { key, physical_key, pressed, repeat, modifiers } => {
+-                if pressed && key == egui::Key::F && modifiers.ctrl && modifiers.alt && modifiers.shift {
++                if pressed && !repeat && key == egui::Key::F && modifiers.ctrl && modifiers.alt && modifiers.shift {
++                    for message in live.keyboard.local_shortcut() {
++                        live.session.input(message);
++                    }
+                     if live.match_screen {
+                         toggle_match(ctx, live);
+                     } else {
+@@ -903,39 +950,49 @@ fn handle_input(ctx: &egui::Context, live: &mut Live, rect: Rect, over: bool, le
+                     }
+                     continue;
+                 }
+-                if repeat {
++                if !keyboard_active || repeat {
+                     continue;   // the host's own key repeat runs while the key is down
+                 }
+                 if let Some(u) = input::hid(physical_key.unwrap_or(key)) {
+-                    live.session.input(input::key(u, pressed, &modifiers));
++                    let remote = input::remote_modifiers(modifiers, live.mac_shortcuts);
++                    for message in live.keyboard.key(u, pressed, remote) {
++                        live.session.input(message);
++                    }
+                 }
+             }
+             // The platform turned these shortcuts into clipboard events: send the keys they were.
+-            egui::Event::Copy => tap(live, egui::Key::C, &mods),
+-            egui::Event::Cut => tap(live, egui::Key::X, &mods),
+-            egui::Event::Paste(text) => {
++            egui::Event::Copy if keyboard_active => tap(live, egui::Key::C, &mods),
++            egui::Event::Cut if keyboard_active => tap(live, egui::Key::X, &mods),
++            egui::Event::Paste(text) if keyboard_active => {
+                 live.session.offer_clipboard(&text);   // the host gets the newest text before the keys
+                 tap(live, egui::Key::V, &mods)
+             }
+             _ => {}
+         }
+     }
++    // Key events carry their own modifier snapshot. Apply the frame's final snapshot last:
++    // a complete Ctrl+Q press and release can arrive in one frame with Ctrl already up.
++    if keyboard_active {
++        for message in live.keyboard.modifiers(input::remote_modifiers(mods, live.mac_shortcuts)) {
++            live.session.input(message);
++        }
++    }
+     let _ = leave;
+ }
+ 
+-fn tap(live: &Live, key: egui::Key, mods: &Modifiers) {
++fn tap(live: &mut Live, key: egui::Key, mods: &Modifiers) {
+     if let Some(u) = input::hid(key) {
+-        live.session.input(input::key(u, true, mods));
+-        live.session.input(input::key(u, false, mods));
++        let remote = input::clipboard_modifiers(*mods, live.mac_shortcuts);
++        for message in live.keyboard.tap(u, remote) {
++            live.session.input(message);
++        }
+     }
+ }
+ 
+ fn release_all(live: &mut Live) {
+-    let none = Modifiers::NONE;
+-    for (usage, down) in input::modifier_changes(&live.sent_mods, &none) {
+-        live.session.input(input::key(usage, down, &none));
++    for message in live.keyboard.release_all() {
++        live.session.input(message);
+     }
+-    live.sent_mods = none;
+     for b in std::mem::take(&mut live.buttons_down) {
+         live.session.input(input::pointer(&b.replace("Down", "Up"), live.last_pos.0, live.last_pos.1));
+     }
+diff --git a/viewer/src/input.rs b/viewer/src/input.rs
+index e8f82ec..507d8a2 100644
+--- a/viewer/src/input.rs
++++ b/viewer/src/input.rs
+@@ -8,6 +8,112 @@ pub const HID_SHIFT: u32 = 0xE1;
+ pub const HID_ALT: u32 = 0xE2;
+ pub const HID_CMD: u32 = 0xE3;
+ 
++/// Only the outgoing stream is remapped; egui keeps the local modifiers for its own shortcuts.
++pub fn remote_modifiers(local: Modifiers, mac_shortcuts: bool) -> Modifiers {
++    if mac_shortcuts {
++        Modifiers {
++            ctrl: false,
++            mac_cmd: local.mac_cmd || local.ctrl,
++            command: local.mac_cmd || local.ctrl,
++            ..local
++        }
++    } else {
++        local
++    }
++}
++
++/// Copy/Cut/Paste events may arrive after Ctrl was released in the same UI frame. The event
++/// still represents a shortcut; reconstruct its modifier instead of sending a bare C/X/V.
++pub fn clipboard_modifiers(local: Modifiers, mac_shortcuts: bool) -> Modifiers {
++    let mut remote = remote_modifiers(local, mac_shortcuts);
++    if !remote.ctrl && !remote.mac_cmd {
++        if mac_shortcuts || cfg!(target_os = "macos") {
++            remote.mac_cmd = true;
++        } else {
++            remote.ctrl = true;
++        }
++        remote.command = true;
++    }
++    remote
++}
++
++/// The keys actually sent to a host, including modifiers after remapping. Releases use the same
++/// state on focus loss, disconnect and a mapping change, so Command cannot remain held remotely.
++#[derive(Default)]
++pub struct Keyboard {
++    modifiers: Modifiers,
++    held: Vec<u32>,
++    local_shortcut: bool,
++}
++
++impl Keyboard {
++    fn suppressed(&mut self, next: Modifiers) -> bool {
++        if self.local_shortcut && flags(&next) == 0 {
++            self.local_shortcut = false;
++        }
++        self.local_shortcut
++    }
++
++    pub fn modifiers(&mut self, next: Modifiers) -> Vec<Value> {
++        if self.suppressed(next) {
++            return Vec::new();
++        }
++        let events = modifier_changes(&self.modifiers, &next)
++            .into_iter()
++            .map(|(usage, down)| key(usage, down, &next))
++            .collect();
++        self.modifiers = next;
++        events
++    }
++
++    pub fn key(&mut self, usage: u32, down: bool, modifiers: Modifiers) -> Vec<Value> {
++        if self.suppressed(modifiers) {
++            return Vec::new();
++        }
++        let mut events = self.modifiers(modifiers);
++        if down {
++            if self.held.contains(&usage) {
++                return events; // key repeat belongs to the host
++            }
++            self.held.push(usage);
++        } else {
++            if !self.held.contains(&usage) {
++                return events; // no matching press was sent (for example, a local shortcut)
++            }
++            self.held.retain(|&held| held != usage);
++        }
++        events.push(key(usage, down, &modifiers));
++        events
++    }
++
++    pub fn tap(&mut self, usage: u32, modifiers: Modifiers) -> Vec<Value> {
++        if self.held.contains(&usage) {
++            return Vec::new();
++        }
++        let mut events = self.key(usage, true, modifiers);
++        events.extend(self.key(usage, false, modifiers));
++        events
++    }
++
++    pub fn release_all(&mut self) -> Vec<Value> {
++        self.local_shortcut = false;
++        // Let go of ordinary keys before their modifiers, just as a person releases a chord.
++        let mut events: Vec<_> = self.held.drain(..)
++            .map(|usage| key(usage, false, &self.modifiers))
++            .collect();
++        events.extend(self.modifiers(Modifiers::NONE));
++        events
++    }
++
++    /// A local fullscreen shortcut must not turn into Command+Option+Shift on the Mac.
++    /// Wait until its physical modifiers are released before accepting another remote chord.
++    pub fn local_shortcut(&mut self) -> Vec<Value> {
++        let events = self.release_all();
++        self.local_shortcut = true;
++        events
++    }
++}
++
+ pub fn hid(key: Key) -> Option<u32> {
+     use Key::*;
+     let letters = [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z];
+diff --git a/viewer/tests/keyboard/Cargo.lock b/viewer/tests/keyboard/Cargo.lock
+new file mode 100644
+index 0000000..11a70bf
+--- /dev/null
++++ b/viewer/tests/keyboard/Cargo.lock
+@@ -0,0 +1,316 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "ab_glyph"
++version = "0.2.32"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "01c0457472c38ea5bd1c3b5ada5e368271cb550be7a4ca4a0b4634e9913f6cc2"
++dependencies = [
++ "ab_glyph_rasterizer",
++ "owned_ttf_parser",
++]
++
++[[package]]
++name = "ab_glyph_rasterizer"
++version = "0.1.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
++
++[[package]]
++name = "ahash"
++version = "0.8.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
++dependencies = [
++ "cfg-if",
++ "once_cell",
++ "version_check",
++ "zerocopy",
++]
++
++[[package]]
++name = "bitflags"
++version = "2.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
++
++[[package]]
++name = "cfg-if"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
++
++[[package]]
++name = "ecolor"
++version = "0.29.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "775cfde491852059e386c4e1deb4aef381c617dc364184c6f6afee99b87c402b"
++dependencies = [
++ "emath",
++]
++
++[[package]]
++name = "egui"
++version = "0.29.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "53eafabcce0cb2325a59a98736efe0bf060585b437763f8c476957fb274bb974"
++dependencies = [
++ "ahash",
++ "emath",
++ "epaint",
++ "nohash-hasher",
++]
++
++[[package]]
++name = "emath"
++version = "0.29.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b1fe0049ce51d0fb414d029e668dd72eb30bc2b739bf34296ed97bd33df544f3"
++
++[[package]]
++name = "epaint"
++version = "0.29.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a32af8da821bd4f43f2c137e295459ee2e1661d87ca8779dfa0eaf45d870e20f"
++dependencies = [
++ "ab_glyph",
++ "ahash",
++ "ecolor",
++ "emath",
++ "nohash-hasher",
++ "parking_lot",
++]
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
++[[package]]
++name = "libc"
++version = "0.2.191"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
++
++[[package]]
++name = "lock_api"
++version = "0.4.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
++dependencies = [
++ "scopeguard",
++]
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "nohash-hasher"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
++
++[[package]]
++name = "once_cell"
++version = "1.21.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
++
++[[package]]
++name = "owned_ttf_parser"
++version = "0.25.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
++dependencies = [
++ "ttf-parser",
++]
++
++[[package]]
++name = "parking_lot"
++version = "0.12.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
++dependencies = [
++ "lock_api",
++ "parking_lot_core",
++]
++
++[[package]]
++name = "parking_lot_core"
++version = "0.9.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "redox_syscall",
++ "smallvec",
++ "windows-link",
++]
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "redox_syscall"
++version = "0.5.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
++dependencies = [
++ "bitflags",
++]
++
++[[package]]
++name = "scopeguard"
++version = "1.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.9",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.154"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "sill-keyboard-checks"
++version = "0.1.0"
++dependencies = [
++ "egui",
++ "serde_json",
++]
++
++[[package]]
++name = "smallvec"
++version = "1.16.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
++
++[[package]]
++name = "syn"
++version = "2.0.119"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "syn"
++version = "3.0.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "ttf-parser"
++version = "0.25.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
++
++[[package]]
++name = "version_check"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
++
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
++
++[[package]]
++name = "zerocopy"
++version = "0.8.63"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
++dependencies = [
++ "zerocopy-derive",
++]
++
++[[package]]
++name = "zerocopy-derive"
++version = "0.8.63"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git a/viewer/tests/keyboard/Cargo.toml b/viewer/tests/keyboard/Cargo.toml
+new file mode 100644
+index 0000000..1f5554b
+--- /dev/null
++++ b/viewer/tests/keyboard/Cargo.toml
+@@ -0,0 +1,12 @@
++[package]
++name = "sill-keyboard-checks"
++version = "0.1.0"
++edition = "2021"
++publish = false
++
++[lib]
++path = "lib.rs"
++
++[dependencies]
++egui = { version = "=0.29.1", default-features = false }
++serde_json = "1"
+diff --git a/viewer/tests/keyboard/lib.rs b/viewer/tests/keyboard/lib.rs
+new file mode 100644
+index 0000000..95d2f62
+--- /dev/null
++++ b/viewer/tests/keyboard/lib.rs
+@@ -0,0 +1,192 @@
++//! Test the real input module without FFmpeg, a graphics device or a running Mac.
++//! The viewer imports egui through eframe; expose the same path using the exact egui version.
++extern crate self as eframe;
++pub use egui;
++
++#[path = "../../src/input.rs"]
++pub mod input;
++
++#[cfg(test)]
++mod tests {
++    use super::input::{self, Keyboard, HID_ALT, HID_CMD, HID_CTRL, HID_SHIFT};
++    use egui::{Key, Modifiers};
++    use serde_json::Value;
++
++    const CMD: u64 = 0x100000;
++    const CTRL: u64 = 0x40000;
++    const SHIFT: u64 = 0x20000;
++    const ALT: u64 = 0x80000;
++
++    fn keys(events: &[Value]) -> Vec<(u32, bool, u64)> {
++        events.iter().map(|v| {
++            let k = &v["key"];
++            (k["hidUsage"].as_u64().unwrap() as u32,
++             k["down"].as_bool().unwrap(), k["modifiers"].as_u64().unwrap())
++        }).collect()
++    }
++
++    fn mac(local: Modifiers) -> Modifiers {
++        input::remote_modifiers(local, true)
++    }
++
++    #[test]
++    fn common_windows_shortcuts_send_command_not_control() {
++        for (letter, usage) in [(Key::Q, 0x14), (Key::W, 0x1A), (Key::S, 0x16),
++                                (Key::C, 0x06), (Key::V, 0x19), (Key::A, 0x04),
++                                (Key::Z, 0x1D), (Key::T, 0x17)] {
++            let mut keyboard = Keyboard::default();
++            let events = keyboard.key(input::hid(letter).unwrap(), true, mac(Modifiers::CTRL));
++            assert_eq!(keys(&events), [(HID_CMD, true, CMD), (usage, true, CMD)]);
++        }
++    }
++
++    #[test]
++    fn native_mode_keeps_control_for_terminal_shortcuts() {
++        let mut keyboard = Keyboard::default();
++        let mods = input::remote_modifiers(Modifiers::CTRL, false);
++        assert_eq!(keys(&keyboard.key(0x06, true, mods)),
++                   [(HID_CTRL, true, CTRL), (0x06, true, CTRL)]);
++    }
++
++    #[test]
++    fn shift_and_option_survive_mac_mapping() {
++        let mut keyboard = Keyboard::default();
++        let local = Modifiers { ctrl: true, shift: true, alt: true, ..Modifiers::NONE };
++        let events = keys(&keyboard.key(0x16, true, mac(local)));
++        assert_eq!(events, [(HID_SHIFT, true, CMD | SHIFT | ALT),
++                           (HID_ALT, true, CMD | SHIFT | ALT),
++                           (HID_CMD, true, CMD | SHIFT | ALT),
++                           (0x16, true, CMD | SHIFT | ALT)]);
++    }
++
++    #[test]
++    fn native_mac_command_is_preserved_in_both_modes() {
++        let local = Modifiers { mac_cmd: true, command: true, ..Modifiers::NONE };
++        for enabled in [false, true] {
++            assert_eq!(input::flags(&input::remote_modifiers(local, enabled)), CMD);
++        }
++    }
++
++    #[test]
++    fn unmodified_typing_stays_unmodified() {
++        assert_eq!(input::flags(&mac(Modifiers::NONE)), 0);
++        let mut keyboard = Keyboard::default();
++        assert_eq!(keys(&keyboard.key(0x14, true, mac(Modifiers::NONE))), [(0x14, true, 0)]);
++    }
++
++    #[test]
++    fn fast_chord_keeps_event_modifiers_when_frame_ends_with_control_up() {
++        let mut keyboard = Keyboard::default();
++        let mut events = keyboard.key(0x14, true, mac(Modifiers::CTRL));
++        events.extend(keyboard.key(0x14, false, mac(Modifiers::CTRL)));
++        events.extend(keyboard.modifiers(mac(Modifiers::NONE)));
++        assert_eq!(keys(&events), [(HID_CMD, true, CMD), (0x14, true, CMD),
++                                  (0x14, false, CMD), (HID_CMD, false, 0)]);
++    }
++
++    #[test]
++    fn releasing_control_before_letter_does_not_leave_command_down() {
++        let mut keyboard = Keyboard::default();
++        keyboard.key(0x14, true, mac(Modifiers::CTRL));
++        assert_eq!(keys(&keyboard.key(0x14, false, Modifiers::NONE)),
++                   [(HID_CMD, false, 0), (0x14, false, 0)]);
++        assert!(keyboard.release_all().is_empty());
++    }
++
++    #[test]
++    fn focus_loss_releases_letter_before_command_and_is_idempotent() {
++        let mut keyboard = Keyboard::default();
++        keyboard.key(0x14, true, mac(Modifiers::CTRL));
++        assert_eq!(keys(&keyboard.release_all()), [(0x14, false, CMD), (HID_CMD, false, 0)]);
++        assert!(keyboard.release_all().is_empty());
++    }
++
++    #[test]
++    fn mapping_switch_releases_command_before_new_control_press() {
++        let mut keyboard = Keyboard::default();
++        keyboard.modifiers(mac(Modifiers::CTRL));
++        let mut events = keyboard.release_all();
++        events.extend(keyboard.key(0x06, true, Modifiers::CTRL));
++        assert_eq!(keys(&events), [(HID_CMD, false, 0), (HID_CTRL, true, CTRL),
++                                  (0x06, true, CTRL)]);
++    }
++
++    #[test]
++    fn repeated_presses_are_not_duplicated() {
++        let mut keyboard = Keyboard::default();
++        keyboard.key(0x14, true, mac(Modifiers::CTRL));
++        assert!(keyboard.key(0x14, true, mac(Modifiers::CTRL)).is_empty());
++        assert_eq!(keys(&keyboard.release_all()).iter().filter(|k| k.0 == 0x14).count(), 1);
++    }
++
++    #[test]
++    fn unmatched_key_release_is_not_forwarded() {
++        let mut keyboard = Keyboard::default();
++        assert!(keyboard.key(0x09, false, Modifiers::NONE).is_empty());
++    }
++
++    #[test]
++    fn clipboard_events_send_command_c_x_v() {
++        for usage in [0x06, 0x1B, 0x19] {
++            let mut keyboard = Keyboard::default();
++            let mods = input::clipboard_modifiers(Modifiers::CTRL, true);
++            let mut events = keyboard.tap(usage, mods);
++            events.extend(keyboard.modifiers(Modifiers::NONE));
++            assert_eq!(keys(&events), [(HID_CMD, true, CMD), (usage, true, CMD),
++                                      (usage, false, CMD), (HID_CMD, false, 0)]);
++        }
++    }
++
++    #[test]
++    fn clipboard_event_after_control_release_still_sends_command() {
++        let mut keyboard = Keyboard::default();
++        let mods = input::clipboard_modifiers(Modifiers::NONE, true);
++        assert_eq!(keys(&keyboard.tap(0x19, mods)),
++                   [(HID_CMD, true, CMD), (0x19, true, CMD), (0x19, false, CMD)]);
++    }
++
++    #[test]
++    fn clipboard_event_does_not_release_a_letter_already_held() {
++        let mut keyboard = Keyboard::default();
++        keyboard.key(0x06, true, mac(Modifiers::CTRL));
++        assert!(keyboard.tap(0x06, mac(Modifiers::CTRL)).is_empty());
++        assert_eq!(keys(&keyboard.release_all()), [(0x06, false, CMD), (HID_CMD, false, 0)]);
++    }
++
++    #[test]
++    fn new_press_works_after_focus_returns() {
++        let mut keyboard = Keyboard::default();
++        keyboard.key(0x14, true, mac(Modifiers::CTRL));
++        keyboard.release_all();
++        assert_eq!(keys(&keyboard.key(0x14, true, mac(Modifiers::CTRL))),
++                   [(HID_CMD, true, CMD), (0x14, true, CMD)]);
++    }
++
++    #[test]
++    fn local_fullscreen_chord_releases_remote_modifiers_until_all_are_up() {
++        let mut keyboard = Keyboard::default();
++        keyboard.modifiers(mac(Modifiers::CTRL));
++        assert_eq!(keys(&keyboard.local_shortcut()), [(HID_CMD, false, 0)]);
++        let chord = mac(Modifiers { ctrl: true, shift: true, alt: true, ..Modifiers::NONE });
++        assert!(keyboard.modifiers(chord).is_empty());
++        assert!(keyboard.key(0x09, false, chord).is_empty());
++        assert!(keyboard.modifiers(mac(Modifiers::CTRL)).is_empty());
++        assert!(keyboard.modifiers(Modifiers::NONE).is_empty());
++        assert_eq!(keys(&keyboard.key(0x14, true, mac(Modifiers::CTRL))),
++                   [(HID_CMD, true, CMD), (0x14, true, CMD)]);
++    }
++
++    #[test]
++    fn every_modifier_combination_preserves_shift_and_option_without_control() {
++        for bits in 0..16 {
++            let local = Modifiers { shift: bits & 1 != 0, ctrl: bits & 2 != 0,
++                alt: bits & 4 != 0, mac_cmd: bits & 8 != 0, command: false };
++            let remote = mac(local);
++            assert_eq!(remote.shift, local.shift);
++            assert_eq!(remote.alt, local.alt);
++            assert!(!remote.ctrl);
++            assert_eq!(remote.mac_cmd, local.ctrl || local.mac_cmd);
++            assert_eq!(input::remote_modifiers(local, false), local);
++        }
++    }
++}

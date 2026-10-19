@@ -1,0 +1,40 @@
+name: Windows with Mac shortcuts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  keyboard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keyboard regression checks
+        run: cargo test --locked --manifest-path viewer/tests/keyboard/Cargo.toml
+
+  windows:
+    needs: keyboard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Same cross-compilation tools and FFmpeg preparation as the upstream build workflow.
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mingw-w64 mingw-w64-tools clang libclang-dev wine64 zip python3-pip
+          rustup target add x86_64-pc-windows-gnu
+          sudo mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc || true
+          echo ':DOSWin:M::MZ::/usr/bin/wine:' | sudo tee /proc/sys/fs/binfmt_misc/register
+          WINEDEBUG=-all wineboot -i || true
+      - name: FFmpeg for Windows
+        run: bash viewer/scripts/prepare-ffmpeg-windows.sh "$RUNNER_TEMP/ffmpeg-win"
+      - name: Build and package
+        working-directory: viewer
+        run: FFMPEG_WIN="$RUNNER_TEMP/ffmpeg-win" bash ./build-windows.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SillViewer-windows-mac-shortcuts
+          path: viewer/target/SillViewer-windows.zip
+          if-no-files-found: error
