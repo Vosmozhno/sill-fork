@@ -2,6 +2,8 @@ name: Windows with Mac shortcuts
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -10,7 +12,23 @@ jobs:
   keyboard:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Verify source files
+        run: |
+          entry="$(git ls-tree HEAD viewer)"
+          case "$entry" in
+            160000*) echo '::error::viewer is a Git submodule; commit its source files as a normal directory.'; exit 1 ;;
+          esac
+          test -f viewer/tests/keyboard/Cargo.toml
+          test -f viewer/src/input.rs
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
       - name: Keyboard regression checks
         run: cargo test --locked --manifest-path viewer/tests/keyboard/Cargo.toml
 
@@ -18,7 +36,15 @@ jobs:
     needs: keyboard
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
       # Same cross-compilation tools and FFmpeg preparation as the upstream build workflow.
       - name: Tools
         run: |
@@ -33,7 +59,7 @@ jobs:
       - name: Build and package
         working-directory: viewer
         run: FFMPEG_WIN="$RUNNER_TEMP/ffmpeg-win" bash ./build-windows.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: SillViewer-windows-mac-shortcuts
           path: viewer/target/SillViewer-windows.zip
